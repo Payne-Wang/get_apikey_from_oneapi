@@ -94,7 +94,7 @@ COOKIE_FILE <- "cookies.txt"            # 可根据需要修改
 
 ## 文件说明
 
-- `script.R`：主脚本文件，包含所有自动化操作的代码。
+- `code.R`：主脚本文件，包含所有自动化操作的代码。
 - `cookies.txt`：保存会话 Cookie，用于后续的 API 请求。
 - `response_self.json`：保存获取到的用户信息。
 - `put_responses_gptproxy.csv`：保存所有 PUT 请求的响应结果。
