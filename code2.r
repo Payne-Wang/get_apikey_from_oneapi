@@ -1,197 +1,182 @@
-library(httr)
-library(jsonlite)
-library(lubridate)
-library(logging)
-library(base64enc)
-library(dplyr)
-
-# 配置日志
-basicConfig()
-addHandler(writeToFile, file = "app.log")
+# daily_shiny_app.R
 
 # 设置代理
 Sys.setenv(http_proxy = "http://127.0.0.1:7890")
 Sys.setenv(https_proxy = "http://127.0.0.1:7890")
 
-# 定义凭证
-username <- "root"
-password <- "123456"
+# 加载必要的包
+library(shiny)
+library(DT)
+library(dplyr)
+library(stringr)
+library(shinycssloaders)
 
-# 函数：登录并获取Cookie
-get_cookies <- function(url, username, password) {
+# 设置结果文件路径
+results_path <- ""
+
+# 函数：读取结果文件并提取日期
+get_result_dates <- function(path) {
+  files <- list.files(path, pattern = "^apikey_channelid_response_\\d{4}-\\d{2}-\\d{2}\\.txt$", full.names = FALSE)
+  dates <- str_match(files, "^apikey_channelid_response_(\\d{4}-\\d{2}-\\d{2})\\.txt$")[,2]
+  dates <- dates[!is.na(dates)]
+  dates <- sort(unique(dates), decreasing = TRUE)
+  return(dates)
+}
+
+# 函数：读取单个结果文件
+read_single_result_file <- function(file_full_path) {
   tryCatch({
-    resp <- POST(
-      url = modify_url(url, path = "/api/user/login"),
-      body = list(username = username, password = password),
-      encode = "json",
-      config = config(ssl_verifypeer = FALSE)
-    )
-    
-    if (status_code(resp) != 200) {
-      logerror(paste("登录失败，URL:", url, "状态码：", status_code(resp)))
-      return(NULL)
-    }
-    
-    cookies <- cookies(resp)[["value"]]
-    if (is.null(cookies)) {
-      logerror(paste("未能获取到Cookie，URL:", url))
-      return(NULL)
-    }
-    
-    return(cookies)
+    read.table(file_full_path, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
   }, error = function(e) {
-    logerror(paste("登录时发生错误，URL:", url, "错误信息：", e$message))
+    warning("读取文件失败：", file_full_path, "，错误：", e$message)
     return(NULL)
   })
 }
 
-# 函数：通过Cookie获取Access Token
-get_access_token <- function(url, cookies) {
-  tryCatch({
-    resp <- GET(
-      url = modify_url(url, path = "/api/user/self"),
-      add_headers("Cookie" = cookies, "New-Api-User" = "1")
-    )
-    
-    if (status_code(resp) != 200) {
-      logerror(paste("获取Access Token失败，URL:", url, "状态码：", status_code(resp)))
-      return(NULL)
+# Shiny UI
+ui <- fluidPage(
+  tags$head(
+    # 引入Bootstrap CSS
+    tags$link(rel = "stylesheet", href = "https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css")
+  ),
+  tags$style(HTML("
+    .container {
+      margin-top: 30px;
     }
-    
-    at <- content(resp)$data$access_token
-    if (is.null(at)) {
-      logerror(paste("未能获取到Access Token，URL:", url))
-      return(NULL)
+    .filter-section {
+      margin-bottom: 20px;
     }
-    
-    return(at)
-  }, error = function(e) {
-    logerror(paste("获取Access Token时发生错误，URL:", url, "错误信息：", e$message))
-    return(NULL)
+  ")),
+  div(class = "container",
+      h2(class = "mb-4", "渠道模型测试结果管理系统"),
+      div(class = "filter-section",
+          div(class = "row",
+              div(class = "col-md-4",
+                  tags$label("按日期筛选：", `for` = "dateFilter", class = "form-label"),
+                  selectInput("dateFilter", label = NULL, choices = NULL, selected = NULL)
+              )
+          )
+      ),
+      DTOutput("resultTable") %>% withSpinner()
+  )
+)
+
+# Shiny Server
+server <- function(input, output, session) {
+  
+  # 获取所有日期
+  dates <- reactive({
+    get_result_dates(results_path)
   })
-}
-
-# 函数：获取所有渠道信息（支持分页）
-get_all_channels <- function(url, at) {
-  all_channels <- list()
-  page <- 0
-  page_size <- 20
-  repeat {
-    tryCatch({
-      resp <- GET(
-        url = modify_url(url, path = "/api/channel/"),
-        query = list(p = page, page_size = page_size),
-        add_headers(Authorization = paste("Bearer", at), "New-Api-User" = "1")
-      )
-      
-      if (status_code(resp) != 200) {
-        logerror(paste("获取渠道信息失败，URL:", url, "状态码：", status_code(resp)))
-        break
+  
+  # 初始化日期筛选下拉菜单
+  observe({
+    available_dates <- dates()
+    choices <- c("所有时间", available_dates)
+    
+    # 默认选择最新日期
+    if (length(available_dates) > 0) {
+      selected_date <- "所有时间"
+    } else {
+      selected_date <- NULL
+    }
+    
+    updateSelectInput(session, "dateFilter",
+                      choices = choices,
+                      selected = selected_date)
+  })
+  
+  # 读取并合并结果数据
+  all_results <- reactive({
+    selected_date <- input$dateFilter
+    if (is.null(selected_date) || selected_date == "") {
+      return(NULL)
+    }
+    
+    data <- NULL
+    
+    if (selected_date == "所有时间") {
+      dates_selected <- dates()
+      if (length(dates_selected) == 0) {
+        return(NULL)
       }
       
-      data <- content(resp)$data
-      if (length(data) == 0) {
-        break
+      for (date in dates_selected) {
+        file_name <- paste0("apikey_channelid_response_", date, ".txt")
+        file_full_path <- file.path(results_path, file_name)
+        
+        if (file.exists(file_full_path)) {
+          temp_data <- read_single_result_file(file_full_path)
+          if (!is.null(temp_data)) {
+            temp_data$Date <- date  # 添加日期列
+            data <- bind_rows(data, temp_data)
+          }
+        }
       }
+    } else {
+      # 构建文件名
+      file_name <- paste0("apikey_channelid_response_", selected_date, ".txt")
+      file_full_path <- file.path(results_path, file_name)
       
-      all_channels <- c(all_channels, data)
-      page <- page + 1
-    }, error = function(e) {
-      logerror(paste("获取渠道信息时发生错误，URL:", url, "错误信息：", e$message))
-      break
-    })
-  }
-  
-  if (length(all_channels) == 0) {
-    logwarn(paste("未获取到任何渠道信息，URL:", url))
-  }
-  
-  return(all_channels)
-}
-
-# 函数：获取每个渠道的Key
-get_channel_keys <- function(url, at, cha_ids) {
-  keys <- list()
-  
-  for (x in cha_ids) {
-    tryCatch({
-      resp_1 <- PUT(
-        url = modify_url(url, path = "/api/channel"),
-        add_headers(Authorization = paste("Bearer", at), "New-Api-User" = "1"),
-        body = list(id = x),
-        encode = "json"
-      )
-      
-      if (status_code(resp_1) != 200) {
-        logerror(paste("更新渠道", x, "失败，URL:", url, "状态码：", status_code(resp_1)))
-        next
+      if (file.exists(file_full_path)) {
+        data <- read_single_result_file(file_full_path)
+        if (!is.null(data)) {
+          data$Date <- selected_date  # 添加日期列
+        }
       }
-      
-      cha_df <- content(resp_1)$data
-      keys[[as.character(x)]] <- cha_df
-    }, error = function(e) {
-      logerror(paste("获取渠道", x, "的Key时发生错误，URL:", url, "错误信息：", e$message))
-    })
-  }
+    }
+    
+    if (is.null(data)) {
+      return(NULL)
+    }
+    
+    # 根据需求进行去重或其他处理
+    # 例如，去重基于id和model的组合
+    data <- data %>%
+      distinct(id, successful_models, .keep_all = TRUE)
+    
+    return(data)
+  })
   
-  return(keys)
+  # 渲染数据表
+  output$resultTable <- renderDT({
+    data <- all_results()
+    if (is.null(data) || nrow(data) == 0) {
+      return(datatable(data.frame("消息" = "没有找到相关数据"),
+                       options = list(dom = 't')))
+    }
+    
+    display_data <- data %>%
+      mutate(
+        `测试日期` = Date,
+        `渠道ID` = id,
+        `类型` = type,
+        `API Key` = key,
+        `基础URL` = base_url,
+        `模型` = models,
+        `成功模型` = successful_models,
+        `来源URL` = source_url,
+        `状态` = ifelse(successful_models != "", 
+                      '<span class="badge bg-success">成功</span>', 
+                      '<span class="badge bg-danger">失败</span>')
+      ) %>%
+      select(`测试日期`, `渠道ID`, `类型`, `API Key`, `基础URL`, `模型`, `成功模型`, `来源URL`, `状态`)
+    
+    datatable(display_data, 
+              escape = FALSE, 
+              options = list(
+                pageLength = 10,
+                autoWidth = TRUE,
+                dom = 'Bfrtip',
+                buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+                language = list(
+                  url = '//cdn.datatables.net/plug-ins/1.10.21/i18n/Chinese.json'
+                )
+              ),
+              rownames = FALSE
+    )
+  }, server = FALSE)
 }
 
-# 主处理函数
-process_url <- function(url, username, password) {
-  loginfo(paste("开始处理URL:", url))
-  
-  cookies <- get_cookies(url, username, password)
-  if (is.null(cookies)) {
-    logerror(paste("跳过URL，因登录失败:", url))
-    return(NULL)
-  }
-  
-  access_token <- get_access_token(url, cookies)
-  if (is.null(access_token)) {
-    logerror(paste("跳过URL，因获取Access Token失败:", url))
-    return(NULL)
-  }
-  
-  channels <- get_all_channels(url, access_token)
-  if (length(channels) == 0) {
-    logerror(paste("跳过URL，因没有渠道信息可处理:", url))
-    return(NULL)
-  }
-  
-  cha_ids <- sapply(channels, function(x) { x$id })
-  channel_keys <- get_channel_keys(url, access_token, cha_ids)
-  
-  loginfo(paste("完成处理URL:", url))
-  return(channel_keys)
-}
-
-# 多个URL列表
-url_list <- read.table("clipboard",header = T,sep = "\t")$V1
-
-# 使用 lapply 遍历URL列表
-results <- lapply(url_list, function(u) {
-  process_url(u, username, password)
-})
-
-selected_url<-url_list[sapply(results,function(x)(!is.null(x)))]
-results<-results[sapply(results,function(x)(!is.null(x)))]
-
-a=lapply(1:length(selected_url),function(x){
-    my_url=selected_url[x]
-    print(my_url)
-    x=results[[x]]
-    lapply(x,function(y){
-      data.frame(id=y$id,
-                 type=y$type,
-                 key=y$key,
-                 models=y$models,
-                 #model_mapping=y$model_mapping,
-                 status=y$status,
-                 base_url=ifelse(is.null(y$base_url),"",y$base_url))
-    })%>%Reduce(rbind,.)->df
-    df$url<-my_url
-    df
-  
-})%>%Reduce(rbind,.)%>%filter(key!="sk-fastgpt")%>%filter(key!="sk-freeapi")
-
+# 运行 Shiny App 并自动在默认浏览器中打开
+runApp(shinyApp(ui = ui, server = server), launch.browser = TRUE)
